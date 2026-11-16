@@ -1,4 +1,4 @@
-# Risk-Adaptive Continuous Authentication (Review 1 build: Stages 1-3)
+# Risk-Adaptive Continuous Authentication 
 
 IAM + privacy-preserving keystroke capture + feature extraction + Isolation Forest / One-Class SVM
 + Risk Engine (Low/Medium/High) + Security Module (continue / increase monitoring / re-authenticate).
@@ -8,7 +8,7 @@ IAM + privacy-preserving keystroke capture + feature extraction + Isolation Fore
 ```
 cd backend
 python -m venv .venv
-.venv\Scripts\activate        # macOS/Linux: source .venv/bin/activate
+.venv\Scripts\activate        
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
