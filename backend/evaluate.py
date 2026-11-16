@@ -82,10 +82,10 @@ def run_levels(votes):
     return [engine.risk_from_votes(votes[: i + 1])[1] for i in range(len(votes))]
 
 
-def evaluate_user(user, data, n_train, n_imp, k):
+def evaluate_user(user, data, n_train, n_imp, k, augment=False):
     X = data[user]
     Xtr, Xg = X[:n_train], X[n_train:]
-    models = engine.train_models(Xtr)
+    models = engine.train_models(Xtr, augment=augment)   # drift augmentation only fits our own 6 features
 
     def raw(M):
         return {"iso": -models["iso"].decision_function(M), "svm": -models["svm"].decision_function(M)}
@@ -150,7 +150,7 @@ def main():
     rows = {}
     for u in data:
         n_train = int(len(data[u]) * a.train_frac)
-        rows[u] = evaluate_user(u, data, n_train, a.imp, a.k)
+        rows[u] = evaluate_user(u, data, n_train, a.imp, a.k, augment=bool(a.db))
         print(f"  done {u}", file=sys.stderr)
     df = pd.DataFrame(rows).T
     df.to_csv(a.out)

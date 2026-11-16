@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS users (
     user_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     username       TEXT NOT NULL UNIQUE,
     password_hash  TEXT NOT NULL,
-    created_at     TEXT NOT NULL
+    created_at     TEXT NOT NULL,
+    role           TEXT NOT NULL DEFAULT 'user'   -- user | admin
 );
 CREATE TABLE IF NOT EXISTS sessions (
     session_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +48,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     login_time   TEXT NOT NULL,
     logout_time  TEXT,
     status       TEXT NOT NULL DEFAULT 'active',  -- active | reauth_required | closed
-    risk_floor   INTEGER NOT NULL DEFAULT 0       -- risk scores up to this id are ignored (reset on re-auth)
+    risk_floor   INTEGER NOT NULL DEFAULT 0,      -- risk scores up to this id are ignored (reset on re-auth)
+    last_seen    TEXT                             -- last typing activity (used to show idle / expire stale sessions)
 );
 CREATE TABLE IF NOT EXISTS keystroke_events (
     event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +135,10 @@ def ensure_schema():
             print(f"[schema] old Stage 1 database moved to {backup}; creating a fresh one")
     with db() as c:
         c.executescript(SCHEMA)
+        if "role" not in [r[1] for r in c.execute("PRAGMA table_info(users)")]:
+            c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        if "last_seen" not in [r[1] for r in c.execute("PRAGMA table_info(sessions)")]:
+            c.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT")
 
 
 ensure_schema()
@@ -195,13 +201,33 @@ def current(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
         raise HTTPException(401, "Invalid or expired token")
     with db() as c:
         s = c.execute(
-            "SELECT s.session_id, s.user_id, s.status, s.risk_floor, u.username FROM sessions s "
+            "SELECT s.session_id, s.user_id, s.status, s.risk_floor, u.username, u.role FROM sessions s "
             "JOIN users u ON u.user_id = s.user_id WHERE s.session_id=? AND s.user_id=?",
             (session_id, user_id),
         ).fetchone()
     if s is None or s["status"] == "closed":
         raise HTTPException(401, "Session closed")
     return dict(s)
+
+
+ADMIN_USER = os.environ.get("KD_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("KD_ADMIN_PASSWORD", "admin12345")  # dev default: change it
+
+
+def seed_admin():
+    with db() as c:
+        if not c.execute("SELECT 1 FROM users WHERE username=?", (ADMIN_USER,)).fetchone():
+            c.execute("INSERT INTO users(username, password_hash, created_at, role) VALUES (?,?,?, 'admin')",
+                      (ADMIN_USER, hash_pw(ADMIN_PASSWORD), now_iso()))
+
+
+seed_admin()
+
+
+def admin_only(auth: dict = Depends(current)) -> dict:
+    if auth["role"] != "admin":
+        raise HTTPException(403, "Admin only")
+    return auth
 
 
 def latest_profile(c, user_id):
@@ -248,6 +274,7 @@ def process_windows(c, sid: int, uid: int) -> dict:
     prev = current_risk(c, sid, floor)
     level_prev = prev["level"] if prev else "low"
     step = engine.STEP_MONITOR if (mode == "monitoring" and level_prev == "medium") else engine.STEP_NORMAL
+    span = engine.RISK_WINDOWS * (engine.STEP_NORMAL // step)   # denser windows -> look back proportionally further
 
     segs = c.execute(
         "SELECT segment, COUNT(*) AS n FROM keystroke_events WHERE session_id=? GROUP BY segment ORDER BY segment",
@@ -264,7 +291,7 @@ def process_windows(c, sid: int, uid: int) -> dict:
         r["vote"]
         for r in c.execute(
             "SELECT vote FROM risk_scores WHERE session_id=? AND score_id>? ORDER BY score_id DESC LIMIT ?",
-            (sid, floor, engine.RISK_WINDOWS - 1),
+            (sid, floor, engine.RISK_WINDOWS * (engine.STEP_NORMAL // engine.STEP_MONITOR) - 1),
         )
     ][::-1]
 
@@ -294,7 +321,7 @@ def process_windows(c, sid: int, uid: int) -> dict:
                 continue
             label, vote = engine.score_window(models, [f[k] for k in engine.FEATURES])
             votes.append(vote)
-            ratio, level = engine.risk_from_votes(votes)
+            ratio, level = engine.risk_from_votes(votes, span)
             ts = now_iso()
             c.execute(
                 "INSERT INTO risk_scores(session_id, window_number, risk_level, anomaly_ratio, vote, window_label, timestamp) "
@@ -314,6 +341,66 @@ def process_windows(c, sid: int, uid: int) -> dict:
             level_prev = level
     return {"mode": mode, "session_status": status, "new_windows": new_windows,
             "risk": latest or current_risk(c, sid, floor)}
+
+
+def fit_profile(c, uid: int):
+    """Train + save both models on a user's enrollment windows. Returns (profile_id, n_windows, models, summary)."""
+    cols = ", ".join(f"fv.{f}" for f in engine.FEATURES)
+    rows = c.execute(
+        f"SELECT {cols} FROM feature_vectors fv JOIN sessions s ON s.session_id=fv.session_id "
+        "WHERE s.user_id=? AND fv.phase='enrollment' ORDER BY fv.vector_id",
+        (uid,),
+    ).fetchall()
+    if len(rows) < MIN_TRAIN_WINDOWS:
+        raise HTTPException(400, f"Need at least {MIN_TRAIN_WINDOWS} enrollment windows, have {len(rows)}")
+    X = np.array([[r[f] for f in engine.FEATURES] for r in rows], dtype=float)
+    models = engine.train_models(X)
+    summary = {f: {"mean": float(X[:, i].mean()), "std": float(X[:, i].std())} for i, f in enumerate(engine.FEATURES)}
+    cur = c.execute(
+        "INSERT INTO behavioral_profiles(user_id, baseline_feature_summary, n_windows, created_at) VALUES (?,?,?,?)",
+        (uid, json.dumps(summary), len(rows), now_iso()),
+    )
+    pid = cur.lastrowid
+    path = os.path.join(MODELS_DIR, f"user{uid}_profile{pid}.joblib")
+    engine.save_models(path, models)
+    c.execute("UPDATE behavioral_profiles SET model_path=? WHERE profile_id=?", (path, pid))
+    return pid, len(rows), models, summary
+
+
+FEATURE_VERSION = 2  # 2 = robust features (modifier keys excluded, medians) + drift-aware training
+
+
+def migrate_features():
+    """Older databases hold features computed the old way. Raw keystrokes are stored, so recompute every
+    window's features and retrain profiles, then close sessions left open by earlier versions."""
+    with db() as c:
+        if c.execute("PRAGMA user_version").fetchone()[0] >= FEATURE_VERSION:
+            return
+        rows = c.execute("SELECT vector_id, session_id, segment, start_idx FROM feature_vectors "
+                         "ORDER BY session_id, segment, start_idx").fetchall()
+        key, ev = None, []
+        for r in rows:
+            if (r["session_id"], r["segment"]) != key:
+                key = (r["session_id"], r["segment"])
+                ev = [(e["key_code"], e["press_time"], e["release_time"]) for e in c.execute(
+                    "SELECT key_code, press_time, release_time FROM keystroke_events "
+                    "WHERE session_id=? AND segment=? ORDER BY seq", key)]
+            f = engine.extract_features(ev[r["start_idx"]: r["start_idx"] + engine.WINDOW_SIZE])
+            c.execute("UPDATE feature_vectors SET dwell_time=?, flight_time=?, typing_speed=?, dwell_std=?, "
+                      "flight_std=?, backspace_ratio=? WHERE vector_id=?",
+                      (f["dwell_time"], f["flight_time"], f["typing_speed"], f["dwell_std"], f["flight_std"],
+                       f["backspace_ratio"], r["vector_id"]))
+        for u in c.execute("SELECT DISTINCT user_id FROM behavioral_profiles").fetchall():
+            try:
+                fit_profile(c, u["user_id"])
+            except HTTPException:
+                pass
+        c.execute("UPDATE sessions SET status='closed', logout_time=? WHERE status != 'closed'", (now_iso(),))
+        c.execute(f"PRAGMA user_version = {FEATURE_VERSION}")
+        print(f"[migrate] recomputed {len(rows)} windows with the robust features and retrained profiles")
+
+
+migrate_features()
 
 
 # ----------------------------------------------------------------- IAM
@@ -348,10 +435,16 @@ def login(body: Credentials):
         u = c.execute("SELECT * FROM users WHERE username=?", (body.username,)).fetchone()
         if u is None or not check_pw(body.password, u["password_hash"]):
             raise HTTPException(401, "Invalid credentials")
-        cur = c.execute("INSERT INTO sessions(user_id, login_time, status) VALUES (?,?, 'active')",
-                        (u["user_id"], now_iso()))
+        t = now_iso()
+        # one open session per user: signing in again closes any earlier session of the same user
+        c.execute("UPDATE sessions SET status='closed', logout_time=? WHERE user_id=? AND status != 'closed'",
+                  (t, u["user_id"]))
+        cur = c.execute("INSERT INTO sessions(user_id, login_time, status, last_seen) VALUES (?,?, 'active', ?)",
+                        (u["user_id"], t, t))
         sid = cur.lastrowid
-    return {"token": make_token(u["user_id"], sid), "session_id": sid, "username": u["username"]}
+        no = session_no(c, sid)
+    return {"token": make_token(u["user_id"], sid), "session_id": sid, "session_no": no,
+            "username": u["username"], "role": u["role"]}
 
 
 @app.post("/auth/logout")
@@ -364,7 +457,7 @@ def logout(auth: dict = Depends(current)):
 
 @app.get("/auth/me")
 def me(auth: dict = Depends(current)):
-    return {"username": auth["username"], "session_id": auth["session_id"], "status": auth["status"]}
+    return {"username": auth["username"], "role": auth["role"], "session_id": auth["session_id"], "status": auth["status"]}
 
 
 @app.post("/sessions/{session_id}/reauth")
@@ -417,6 +510,7 @@ def ingest(batch: Batch, auth: dict = Depends(current)):
             [(sid, segment, seq0 + i, e.key_code, e.press_time, e.release_time) for i, e in enumerate(batch.events)],
         )
         total = c.execute("SELECT COUNT(*) AS n FROM keystroke_events WHERE session_id=?", (sid,)).fetchone()["n"]
+        c.execute("UPDATE sessions SET last_seen=? WHERE session_id=?", (now_iso(), sid))
         result = process_windows(c, sid, auth["user_id"])
     return {"stored": len(batch.events), "segment": segment, "total_events": total, **result}
 
@@ -462,34 +556,13 @@ def profile_status(auth: dict = Depends(current)):
 @app.post("/profile/train")
 def train_profile(auth: dict = Depends(current)):
     """Train Isolation Forest + One-Class SVM on this user's enrollment windows only."""
-    uid = auth["user_id"]
-    cols = ", ".join(f"fv.{f}" for f in engine.FEATURES)
     with db() as c:
-        rows = c.execute(
-            f"SELECT {cols} FROM feature_vectors fv JOIN sessions s ON s.session_id=fv.session_id "
-            "WHERE s.user_id=? AND fv.phase='enrollment' ORDER BY fv.vector_id",
-            (uid,),
-        ).fetchall()
-        if len(rows) < MIN_TRAIN_WINDOWS:
-            raise HTTPException(400, f"Need at least {MIN_TRAIN_WINDOWS} enrollment windows, have {len(rows)}")
-        X = np.array([[r[f] for f in engine.FEATURES] for r in rows], dtype=float)
-        models = engine.train_models(X)
-        summary = {f: {"mean": float(X[:, i].mean()), "std": float(X[:, i].std())}
-                   for i, f in enumerate(engine.FEATURES)}
-        cur = c.execute(
-            "INSERT INTO behavioral_profiles(user_id, baseline_feature_summary, n_windows, created_at) VALUES (?,?,?,?)",
-            (uid, json.dumps(summary), len(rows), now_iso()),
-        )
-        pid = cur.lastrowid
-        path = os.path.join(MODELS_DIR, f"user{uid}_profile{pid}.joblib")
-        engine.save_models(path, models)
-        c.execute("UPDATE behavioral_profiles SET model_path=? WHERE profile_id=?", (path, pid))
-        # start this session's risk history fresh
+        pid, n, models, summary = fit_profile(c, auth["user_id"])
         floor = c.execute("SELECT COALESCE(MAX(score_id),0) AS m FROM risk_scores WHERE session_id=?",
                           (auth["session_id"],)).fetchone()["m"]
         c.execute("UPDATE sessions SET risk_floor=? WHERE session_id=?", (floor, auth["session_id"]))
     _model_cache[pid] = models
-    return {"trained": True, "windows": len(rows), "summary": summary}
+    return {"trained": True, "windows": n, "summary": summary}
 
 
 # ----------------------------------------------------------------- Risk + alerts (for the UI)
@@ -512,3 +585,151 @@ def risk(limit: int = 40, auth: dict = Depends(current)):
         cur = current_risk(c, sid, floor)
     return {"mode": "monitoring" if prof else "enrollment", "current": cur,
             "timeline": [dict(r) for r in tl][::-1], "alerts": [dict(r) for r in al]}
+
+
+# ----------------------------------------------------------------- Admin dashboard API
+STALE_MINUTES = 30   # open sessions with no typing for this long are closed automatically
+IDLE_SECONDS = 90    # shown as Idle in the dashboard after this long without typing
+
+
+def session_no(c, session_id: int) -> int:
+    """Per-user session number: Sara's 1st session is 1, her 2nd is 2, whatever other users did in between.
+    (session_id is the global database id and is not shown to people.)"""
+    return c.execute("SELECT COUNT(*) AS n FROM sessions s2 WHERE s2.user_id=(SELECT user_id FROM sessions WHERE session_id=?) "
+                     "AND s2.session_id<=?", (session_id, session_id)).fetchone()["n"]
+
+
+def idle_seconds(ts):
+    t = datetime.datetime.fromisoformat(ts)
+    return int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds())
+
+
+@app.get("/admin/overview")
+def admin_overview(_: dict = Depends(admin_only)):
+    with db() as c:
+        q = lambda sql: c.execute(sql).fetchone()[0]
+        return {
+            "users": q("SELECT COUNT(*) FROM users WHERE role='user'"),
+            "enrolled": q("SELECT COUNT(DISTINCT user_id) FROM behavioral_profiles"),
+            "active_sessions": q("SELECT COUNT(*) FROM sessions s JOIN users u ON u.user_id=s.user_id "
+                                 "WHERE u.role='user' AND s.status IN ('active','reauth_required')"),
+            "locked_sessions": q("SELECT COUNT(*) FROM sessions s JOIN users u ON u.user_id=s.user_id "
+                                 "WHERE u.role='user' AND s.status='reauth_required'"),
+            "events": q("SELECT COUNT(*) FROM keystroke_events"),
+            "windows": q("SELECT COUNT(*) FROM feature_vectors"),
+            "high_alerts": q("SELECT COUNT(*) FROM alerts WHERE risk_level='high'"),
+        }
+
+
+@app.get("/admin/sessions")
+def admin_sessions(limit: int = 50, _: dict = Depends(admin_only)):
+    limit = max(1, min(limit, 200))
+    with db() as c:
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=STALE_MINUTES)).isoformat(timespec="seconds")
+        c.execute("UPDATE sessions SET status='closed', logout_time=? WHERE status != 'closed' "
+                  "AND COALESCE(last_seen, login_time) < ?", (now_iso(), cutoff))
+        rows = c.execute(
+            "SELECT s.session_id, s.user_id, u.username, s.status, s.login_time, s.logout_time, s.risk_floor, s.last_seen, "
+            "(SELECT COUNT(*) FROM sessions s2 WHERE s2.user_id=s.user_id AND s2.session_id<=s.session_id) AS session_no, "
+            "(SELECT COUNT(*) FROM keystroke_events k WHERE k.session_id=s.session_id) AS events, "
+            "(SELECT COUNT(*) FROM feature_vectors f WHERE f.session_id=s.session_id) AS windows, "
+            "EXISTS(SELECT 1 FROM behavioral_profiles b WHERE b.user_id=s.user_id) AS enrolled "
+            "FROM sessions s JOIN users u ON u.user_id=s.user_id WHERE u.role='user' "
+            "ORDER BY (s.status='closed'), s.session_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["enrolled"] = bool(d["enrolled"])
+            d["risk"] = current_risk(c, r["session_id"], r["risk_floor"]) if d["enrolled"] else None
+            d["idle_seconds"] = idle_seconds(r["last_seen"] or r["login_time"])
+            d["timeline"] = []
+            if d["enrolled"] and r["status"] != "closed":
+                d["timeline"] = [dict(t) for t in c.execute(
+                    "SELECT window_number, risk_level, anomaly_ratio FROM risk_scores WHERE session_id=? "
+                    "ORDER BY score_id DESC LIMIT 30", (r["session_id"],))][::-1]
+            del d["risk_floor"]
+            out.append(d)
+    return out
+
+
+@app.get("/admin/sessions/{session_id}/timeline")
+def admin_timeline(session_id: int, _: dict = Depends(admin_only)):
+    with db() as c:
+        s = c.execute("SELECT s.session_id, s.user_id, s.risk_floor, s.last_seen, s.login_time, u.username, s.status FROM sessions s "
+                      "JOIN users u ON u.user_id=s.user_id WHERE s.session_id=?", (session_id,)).fetchone()
+        if s is None:
+            raise HTTPException(404, "No such session")
+        tl = c.execute("SELECT window_number, risk_level, anomaly_ratio, window_label, timestamp FROM risk_scores "
+                       "WHERE session_id=? ORDER BY score_id DESC LIMIT 60", (session_id,)).fetchall()
+        al = c.execute("SELECT risk_level, action_taken, timestamp FROM alerts WHERE session_id=? "
+                       "ORDER BY alert_id DESC LIMIT 15", (session_id,)).fetchall()
+        enrolled = latest_profile(c, s["user_id"]) is not None
+        cur = current_risk(c, session_id, s["risk_floor"]) if enrolled else None
+        no = session_no(c, session_id)
+    return {"session_id": s["session_id"], "session_no": no, "username": s["username"], "status": s["status"],
+            "enrolled": enrolled, "current": cur, "idle_seconds": idle_seconds(s["last_seen"] or s["login_time"]),
+            "timeline": [dict(r) for r in tl][::-1], "alerts": [dict(r) for r in al]}
+
+
+@app.get("/admin/sessions/{session_id}/keystrokes")
+def admin_keystrokes(session_id: int, limit: int = 50, _: dict = Depends(admin_only)):
+    """Raw keystroke history (key codes and timings only) for one session. Full data: table keystroke_events."""
+    limit = max(1, min(limit, 500))
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) AS n FROM keystroke_events WHERE session_id=?", (session_id,)).fetchone()["n"]
+        rows = c.execute("SELECT event_id, segment, seq, key_code, press_time, release_time FROM keystroke_events "
+                         "WHERE session_id=? ORDER BY event_id DESC LIMIT ?", (session_id, limit)).fetchall()
+    return {"total": total, "events": [dict(r) for r in rows]}
+
+
+@app.get("/admin/alerts")
+def admin_alerts(limit: int = 30, _: dict = Depends(admin_only)):
+    limit = max(1, min(limit, 200))
+    with db() as c:
+        rows = c.execute(
+            "SELECT a.alert_id, a.session_id, u.username, a.risk_level, a.action_taken, a.timestamp, "
+            "(SELECT COUNT(*) FROM sessions s2 WHERE s2.user_id=s.user_id AND s2.session_id<=s.session_id) AS session_no "
+            "FROM alerts a "
+            "JOIN sessions s ON s.session_id=a.session_id JOIN users u ON u.user_id=s.user_id "
+            "ORDER BY a.alert_id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/admin/users")
+def admin_users(_: dict = Depends(admin_only)):
+    with db() as c:
+        rows = c.execute(
+            "SELECT u.user_id, u.username, u.created_at, "
+            "(SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.user_id) AS sessions, "
+            "(SELECT MAX(login_time) FROM sessions s WHERE s.user_id=u.user_id) AS last_login, "
+            "(SELECT COUNT(*) FROM feature_vectors f JOIN sessions s ON s.session_id=f.session_id "
+            " WHERE s.user_id=u.user_id AND f.phase='enrollment') AS enrollment_windows, "
+            "EXISTS(SELECT 1 FROM behavioral_profiles b WHERE b.user_id=u.user_id) AS enrolled "
+            "FROM users u WHERE u.role='user' ORDER BY u.user_id").fetchall()
+    return [{**dict(r), "enrolled": bool(r["enrolled"])} for r in rows]
+
+
+@app.post("/admin/sessions/{session_id}/force-reauth")
+def admin_force_reauth(session_id: int, _: dict = Depends(admin_only)):
+    with db() as c:
+        s = c.execute("SELECT status FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        if s is None or s["status"] == "closed":
+            raise HTTPException(404, "No open session with that id")
+        c.execute("UPDATE sessions SET status='reauth_required' WHERE session_id=?", (session_id,))
+        c.execute("INSERT INTO alerts(session_id, risk_level, action_taken, timestamp) VALUES (?,?,?,?)",
+                  (session_id, "high", "admin_forced_reauth", now_iso()))
+    return {"status": "reauth_required"}
+
+
+@app.post("/admin/sessions/{session_id}/end")
+def admin_end_session(session_id: int, _: dict = Depends(admin_only)):
+    with db() as c:
+        s = c.execute("SELECT status FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        if s is None or s["status"] == "closed":
+            raise HTTPException(404, "No open session with that id")
+        c.execute("UPDATE sessions SET status='closed', logout_time=? WHERE session_id=?", (now_iso(), session_id))
+        c.execute("INSERT INTO alerts(session_id, risk_level, action_taken, timestamp) VALUES (?,?,?,?)",
+                  (session_id, "high", "admin_ended_session", now_iso()))
+    return {"status": "closed"}

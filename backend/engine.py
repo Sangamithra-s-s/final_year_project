@@ -20,33 +20,77 @@ MIN_EVIDENCE = 3      # never judge on fewer windows (drift tolerance)
 LOW_MAX = 0.3         # ratio <  0.3          -> low
 HIGH_MIN = 0.6        # ratio >  0.6          -> high, otherwise medium
 
-ACTIONS = {"low": "continue", "medium": "increase_monitoring", "high": "reauthenticate"}
+ACTIONS = {"collecting": "continue", "low": "continue", "medium": "increase_monitoring", "high": "reauthenticate"}
 
 
 # ------------------------------------------------------------- Feature Module
+# Modifier keys (Shift, Ctrl, Alt, ...) are held while other keys are typed, so their "dwell" measures how long
+# the NEXT letters take, not the user's rhythm. They are left out of the timing features.
+MODIFIERS = {"ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight",
+             "MetaLeft", "MetaRight", "CapsLock", "ContextMenu"}
+DWELL_CAP_MS = 500       # a key held longer than this is not typing rhythm
+FLIGHT_MIN_MS = -150     # overlap deeper than this is noise
+FLIGHT_CAP_MS = 1000     # a gap longer than this is a thinking pause, not rhythm
+
+
+def _spread(a):
+    """Interquartile range: a spread measure that one outlier cannot blow up."""
+    q1, q3 = np.percentile(a, [25, 75])
+    return float(q3 - q1)
+
+
 def extract_features(events):
-    """events: list of (key_code, press_time_ms, release_time_ms). Returns one feature dict.
+    """events: list of (key_code, press_time_ms, release_time_ms) -> one feature dict (robust version).
+
+    Column names are kept for the database, but the meaning is robust:
+      dwell_time / flight_time  = MEDIAN (not mean)       dwell_std / flight_std = IQR (not standard deviation)
+      typing_speed              = 60000 / median press-to-press interval (pauses do not slow it)
+      backspace_ratio           = share of Backspace among non-modifier keys
     Events are sorted by press_time first (they are stored in release order)."""
     ev = sorted(events, key=lambda e: e[1])
-    press = np.array([e[1] for e in ev], dtype=float)
-    release = np.array([e[2] for e in ev], dtype=float)
-    dwell = release - press
-    flight = press[1:] - release[:-1]          # negative = overlapping keys (kept on purpose)
-    span = max(release.max() - press[0], 1.0)
+    keys = [e for e in ev if e[0] not in MODIFIERS]
+    if len(keys) < 5:
+        keys = ev
+    press = np.array([e[1] for e in keys], dtype=float)
+    release = np.array([e[2] for e in keys], dtype=float)
+    dwell = np.clip(release - press, 0, DWELL_CAP_MS)
+    flight = np.clip(press[1:] - release[:-1], FLIGHT_MIN_MS, FLIGHT_CAP_MS)
+    interval = np.clip(np.diff(press), 20, FLIGHT_CAP_MS)
     return {
-        "dwell_time": float(dwell.mean()),
-        "dwell_std": float(dwell.std()),
-        "flight_time": float(flight.mean()),
-        "flight_std": float(flight.std()),
-        "typing_speed": float(len(ev) / span * 60000.0),   # keys per minute
-        "backspace_ratio": sum(1 for e in ev if e[0] == "Backspace") / len(ev),
+        "dwell_time": float(np.median(dwell)),
+        "dwell_std": _spread(dwell),
+        "flight_time": float(np.median(flight)),
+        "flight_std": _spread(flight),
+        "typing_speed": float(60000.0 / max(np.median(interval), 20.0)),
+        "backspace_ratio": sum(1 for e in keys if e[0] == "Backspace") / len(keys),
     }
 
 
 # ------------------------------------------------------------- ML Module
-def train_models(X, contamination=0.05, nu=0.05):
+TIMING_COLS = [0, 1, 2, 3]   # dwell_time, dwell_std, flight_time, flight_std (FEATURES order)
+SPEED_COL = 4                # typing_speed
+DRIFT_FACTORS = (0.88, 0.94, 1.0, 1.06, 1.12)   # people type a little faster/slower from session to session
+
+
+def augment_for_drift(X, factors=DRIFT_FACTORS):
+    """Training copies at slightly different tempo: timings x s, speed / s. Teaches the models that a
+    slightly faster or slower session is still the same person (drift tolerance), while a different
+    typing style is still far outside."""
+    X = np.asarray(X, dtype=float)
+    out = []
+    for s in factors:
+        Y = X.copy()
+        Y[:, TIMING_COLS] *= s
+        Y[:, SPEED_COL] /= s
+        out.append(Y)
+    return np.vstack(out)
+
+
+def train_models(X, contamination=0.05, nu=0.05, augment=True):
     """Fit both one-class models on the legitimate user's own windows only."""
     X = np.asarray(X, dtype=float)
+    if augment:
+        X = augment_for_drift(X)
     iso = make_pipeline(
         StandardScaler(),
         IsolationForest(n_estimators=200, contamination=contamination, random_state=42),
@@ -81,14 +125,16 @@ def load_models(path):
 
 
 # ------------------------------------------------------------- Risk Engine
-def risk_from_votes(votes):
-    """votes: window votes, oldest first. Aggregates the last RISK_WINDOWS into (ratio, level)."""
-    recent = list(votes)[-RISK_WINDOWS:]
+def risk_from_votes(votes, span=RISK_WINDOWS):
+    """votes: window votes, oldest first. Aggregates the last `span` votes into (ratio, level).
+    span is RISK_WINDOWS normally, and 3x larger when windows are 3x denser (step 5), so the evidence
+    always covers about the same amount of typing."""
+    recent = list(votes)[-span:]
     if not recent:
         return 0.0, "low"
     ratio = round(sum(recent) / len(recent), 4)
     if len(recent) < MIN_EVIDENCE:
-        return ratio, "low"
+        return ratio, "collecting"   # not enough windows to judge yet
     if ratio > HIGH_MIN:
         return ratio, "high"
     if ratio >= LOW_MAX:
